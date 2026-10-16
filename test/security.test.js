@@ -9,9 +9,6 @@ const inbox = await fs.mkdtemp(path.join(os.tmpdir(), 'secureshare-test-'))
 process.env.NODE_ENV = 'test'
 process.env.INBOX_DIR = inbox
 process.env.SECURESHARE_SETUP_TOKEN = 'test-setup-credential-that-is-long-and-random'
-process.env.MAX_FILE_BYTES = '64'
-process.env.MAX_PEER_BYTES = '32'
-process.env.MAX_TOTAL_BYTES = '128'
 const { default: app } = await import(`../server.js?test=${Date.now()}`)
 const server = app.listen(0)
 await new Promise((resolve) => server.once('listening', resolve))
@@ -91,23 +88,17 @@ test('pairing envelopes cannot be replayed and malformed requests are rejected',
   assert.equal(result.response.status, 400)
 })
 
-test('oversized encrypted uploads are rejected without becoming indexed', async () => {
+test('encrypted uploads are not limited by file or storage quota size', async () => {
   const form = new FormData()
   form.append('ciphertext', new Blob([new Uint8Array(65)]), 'encrypted.bin')
   form.append('iv', 'AAAAAAAAAAAAAAAA')
   form.append('metadataIv', 'AAAAAAAAAAAAAAAA')
   form.append('metadata', 'AAAA')
   const result = await json(`/api/peers/${pairId}/files`, { method: 'POST', headers: { Authorization: `Bearer ${peerToken}` }, body: form })
-  assert.equal(result.response.status, 413)
+  assert.equal(result.response.status, 201)
   const index = await json(`/api/peers/${pairId}/files`, { headers: { Authorization: `Bearer ${peerToken}` } })
-  assert.deepEqual(index.body, [])
-  const quotaForm = new FormData()
-  quotaForm.append('ciphertext', new Blob([new Uint8Array(33)]), 'encrypted.bin')
-  quotaForm.append('iv', 'AAAAAAAAAAAAAAAA')
-  quotaForm.append('metadataIv', 'AAAAAAAAAAAAAAAA')
-  quotaForm.append('metadata', 'AAAA')
-  const quotaResult = await json(`/api/peers/${pairId}/files`, { method: 'POST', headers: { Authorization: `Bearer ${peerToken}` }, body: quotaForm })
-  assert.equal(quotaResult.response.status, 507)
+  assert.equal(index.body.length, 1)
+  assert.equal(index.body[0].bytes, 65)
 })
 
 test.after(async () => {
