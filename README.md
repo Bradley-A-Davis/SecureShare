@@ -39,45 +39,17 @@ docker compose down
 
 `PUBLIC_URL` is not cosmetic: it is the callback address embedded in encrypted invitations and pairing acceptances. It must be reachable by the peer and match the certificate hostname, including a non-default port.
 
-## Tailscale
+## Domain certificate
 
-Use the machine's MagicDNS fully-qualified name, not its `100.x.y.z` address. A certificate issued for `machine.tailnet.ts.net` cannot validate for `100.102.168.125`.
-
-1. In the Tailscale admin console, enable MagicDNS and HTTPS.
-2. On the Docker host, issue the certificate for its MagicDNS name:
-
-   ```bash
-   sudo tailscale cert --cert-file tls/cert.pem --key-file tls/key.pem machine.tailnet.ts.net
-   ```
-
-3. Set `.env`:
-
-   ```dotenv
-   SECURESHARE_HOST=machine.tailnet.ts.net
-   PUBLIC_URL=https://machine.tailnet.ts.net:23456
-   ```
-
-4. Start Compose and open `https://machine.tailnet.ts.net:23456` from another device in the tailnet.
-
-`tailscale cert` files expire, so renew them before expiry and restart the `caddy` service after replacing the files. Keep the private key in `tls/`; never commit it.
-
-## Localhost and LAN
-
-Use a certificate that matches the address clients use:
-
-- For localhost, use a locally trusted development CA certificate with `localhost`, `127.0.0.1`, and `::1` as SANs.
-- For a LAN address, use an organization/internal CA certificate with the LAN DNS name (and IP SAN only when the CA supports it). Install that CA's public root on the client devices.
-- For a public DNS name, use a certificate from a public CA for that DNS name.
-
-For each case, set `SECURESHARE_HOST` to the certificate hostname/address and `PUBLIC_URL` to its reachable HTTPS URL. A self-signed certificate is useful only for curl testing unless its issuing CA is trusted by the browser.
+Use a certificate from a trusted certificate authority for your SecureShare domain. Its hostname must match both `SECURESHARE_HOST` and the hostname in `PUBLIC_URL`. Place the certificate chain in `tls/cert.pem` and its private key in `tls/key.pem`.
 
 ## Verify TLS
 
 These commands must be run with a hostname covered by the certificate. Do not use `-k` for a real deployment; it is appropriate only when testing a temporary self-signed certificate.
 
 ```bash
-curl --tlsv1.2 --tls-max 1.2 -v https://machine.tailnet.ts.net:23456/api/health
-curl --tlsv1.3 -v https://machine.tailnet.ts.net:23456/api/health
+curl --tlsv1.2 --tls-max 1.2 -v https://share.example.net:23456/api/health
+curl --tlsv1.3 -v https://share.example.net:23456/api/health
 ```
 
 The verbose output should show `TLSv1.2` and `TLSv1.3` respectively, followed by an HTTP `200` response. `docker compose ps` should show a healthy `secureshare` service.
