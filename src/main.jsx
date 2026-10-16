@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { createPairKey, decryptFile, decryptFromPrivateKey, encryptFile, encryptForPublicKey, hasLocalIdentity, loadPeers, savePeers, setupIdentity, unlockIdentity } from './crypto'
+import { createPairKey, decryptFile, decryptFromPrivateKey, decryptMessageMetadata, encryptFile, encryptForPublicKey, hasLocalIdentity, loadPeers, savePeers, setupIdentity, unlockIdentity } from './crypto'
 import './styles.css'
 
 const api = async (path, options = {}) => {
@@ -37,6 +37,8 @@ function App() {
   const [notice, setNotice] = useState('')
   const [selectedPeer, setSelectedPeer] = useState('')
   const [selectedFile, setSelectedFile] = useState(null)
+  const [messageTitle, setMessageTitle] = useState('')
+  const [messageText, setMessageText] = useState('')
   const [received, setReceived] = useState([])
 
   const persistPeers = async (next) => { setPeers(next); await savePeers(session.key, next) }
@@ -58,7 +60,20 @@ function App() {
   useEffect(() => {
     const peer = peers.find((entry) => entry.pairId === selectedPeer)
     if (!peer) return setReceived([])
-    api(`/api/peers/${peer.pairId}/files`).then(setReceived).catch(() => setReceived([]))
+    let cancelled = false
+    const refreshReceived = async () => {
+      try {
+        const records = await api(`/api/peers/${peer.pairId}/files`)
+        const messages = await Promise.all(records.map(async (record) => {
+          try { return { ...record, message: await decryptMessageMetadata(peer.pairKey, peer.pairId, record) } }
+          catch { return record }
+        }))
+        if (!cancelled) setReceived(messages)
+      } catch { if (!cancelled) setReceived([]) }
+    }
+    refreshReceived()
+    const interval = window.setInterval(refreshReceived, 5000)
+    return () => { cancelled = true; window.clearInterval(interval) }
   }, [selectedPeer, peers])
 
   const invitePeer = async (event) => {
@@ -96,21 +111,24 @@ function App() {
   const activateAcceptance = async (acceptance) => {
     const pending = peers.find((peer) => peer.pairId === acceptance.payload.p)
     if (!pending) return setNotice('This acceptance does not match a local invitation.')
-    await api(`/api/peers/${pending.pairId}/activate`, { method: 'POST' })
-    await persistPeers(peers.map((peer) => peer.pairId === pending.pairId ? { ...peer, targetUrl: acceptance.payload.u, uploadToken: acceptance.payload.t, status: 'active' } : peer))
-    setAcceptances((current) => current.filter((entry) => entry.pairId !== acceptance.pairId)); setNotice('Pairing activated.')
+    try {
+      await api(`/api/peers/${pending.pairId}/activate`, { method: 'POST' })
+      await persistPeers(peers.map((peer) => peer.pairId === pending.pairId ? { ...peer, targetUrl: acceptance.payload.u, uploadToken: acceptance.payload.t, status: 'active' } : peer))
+      setAcceptances((current) => current.filter((entry) => entry.pairId !== acceptance.pairId)); setNotice('Pairing activated.')
+    } catch (failure) { setNotice(failure.message) }
   }
 
   const sendFile = async (event) => {
     event.preventDefault(); setNotice('')
     const peer = peers.find((entry) => entry.pairId === selectedPeer)
     if (!peer || !selectedFile || peer.status !== 'active') return setNotice('Choose an active peer and a file.')
+    if (!messageTitle.trim()) return setNotice('Add a message title.')
     try {
-      const encrypted = await encryptFile(peer.pairKey, selectedFile, peer.pairId)
+      const encrypted = await encryptFile(peer.pairKey, selectedFile, peer.pairId, { title: messageTitle.trim(), text: messageText.trim() })
       const form = new FormData(); form.append('ciphertext', encrypted.ciphertext, 'encrypted.bin'); form.append('iv', encrypted.iv); form.append('metadata', encrypted.metadata); form.append('metadataIv', encrypted.metadataIv)
       const response = await fetch(remote(peer.targetUrl, `/api/peers/${peer.pairId}/files`), { method: 'POST', headers: { Authorization: `Bearer ${peer.uploadToken}` }, body: form })
       if (!response.ok) throw new Error((await response.json()).error || 'Encrypted upload failed.')
-      setSelectedFile(null); setNotice('Encrypted file delivered.')
+      setSelectedFile(null); setMessageTitle(''); setMessageText(''); setNotice('Encrypted file delivered.')
     } catch (failure) { setNotice(failure.message) }
   }
 
@@ -124,9 +142,20 @@ function App() {
     } catch { setNotice('Could not decrypt this file.') }
   }
 
+  const deleteMessage = async (record) => {
+    const peer = peers.find((entry) => entry.pairId === selectedPeer)
+    if (!peer || !window.confirm(`Delete “${record.message?.title || record.message?.name || 'this message'}” from this inbox?`)) return
+    try {
+      await api(`/api/peers/${peer.pairId}/files/${record.encryptedId}`, { method: 'DELETE' })
+      setReceived((current) => current.filter((entry) => entry.encryptedId !== record.encryptedId))
+      setNotice('Message deleted.')
+    } catch (failure) { setNotice(failure.message) }
+  }
+
   if (!session) return <LockScreen onUnlock={unlock} />
   const activePeers = peers.filter((peer) => peer.status === 'active')
-  return <main className="workspace"><header><div className="brand"><span className="brand-mark"><i></i><i></i><i></i></span>secure<span>share</span></div><div className="fingerprint">Public key <code>{session.fingerprint.slice(0, 16)}…</code></div><button onClick={() => setSession(null)}>Lock</button></header><section className="layout"><aside><h2>Connections</h2><form className="connect-form" onSubmit={invitePeer}><label>Server address<input required placeholder="https://server.example:23456" value={targetUrl} onChange={(event) => setTargetUrl(event.target.value)} /></label><label>Encrypted note<textarea maxLength="80" value={note} onChange={(event) => setNote(event.target.value)} /></label><button>Request connection</button></form><div className="peer-list">{peers.map((peer) => <div key={peer.pairId}><strong>{peer.targetUrl}</strong><small>{peer.status}</small></div>)}</div></aside><section className="main-pane"><h1>Encrypted inbox</h1>{notice && <p className="notice">{notice}</p>}<div className="pending">{invites.map((invite) => <article key={invite.pairId}><p><b>Connection request</b> from {invite.sourceUrl}</p><code>{invite.sourceFingerprint.slice(0, 16)}…</code>{invite.payload.n && <p className="invite-note">{invite.payload.n}</p>}<button onClick={() => confirmInvite(invite)}>Verify and confirm</button></article>)}{acceptances.map((acceptance) => <article key={acceptance.pairId}><p>Connection acceptance received.</p><button onClick={() => activateAcceptance(acceptance)}>Activate pairing</button></article>)}</div><form className="send-form" onSubmit={sendFile}><label>Send to<select value={selectedPeer} onChange={(event) => setSelectedPeer(event.target.value)}><option value="">Choose a paired server</option>{activePeers.map((peer) => <option value={peer.pairId} key={peer.pairId}>{peer.targetUrl}</option>)}</select></label><input type="file" onChange={(event) => setSelectedFile(event.target.files[0])} /><button>Encrypt and send</button></form><div className="files">{received.map((record) => <button key={record.encryptedId} onClick={() => download(record)}>Decrypt and download · {record.arrivedAt}</button>)}</div></section></section></main>
+  const pendingAcceptances = acceptances.filter((acceptance) => peers.find((peer) => peer.pairId === acceptance.payload.p)?.status !== 'active')
+  return <main className="workspace"><header><div className="brand"><span className="brand-mark"><i></i><i></i><i></i></span>secure<span>share</span></div><div className="fingerprint">Public key <code>{session.fingerprint.slice(0, 16)}…</code></div><button onClick={() => setSession(null)}>Lock</button></header><section className="layout"><aside><h2>Connections</h2><form className="connect-form" onSubmit={invitePeer}><label>Server address<input required placeholder="https://server.example:23456" value={targetUrl} onChange={(event) => setTargetUrl(event.target.value)} /></label><label>Encrypted note<textarea maxLength="80" value={note} onChange={(event) => setNote(event.target.value)} /></label><button>Request connection</button></form><div className="peer-list">{peers.map((peer) => <div key={peer.pairId}><strong>{peer.targetUrl}</strong><small>{peer.status}</small></div>)}</div></aside><section className="main-pane"><h1>Encrypted inbox</h1>{notice && <p className="notice">{notice}</p>}<div className="pending">{invites.map((invite) => <article key={invite.pairId}><p><b>Connection request</b> from {invite.sourceUrl}</p><code>{invite.sourceFingerprint.slice(0, 16)}…</code>{invite.payload.n && <p className="invite-note">{invite.payload.n}</p>}<button onClick={() => confirmInvite(invite)}>Verify and confirm</button></article>)}{pendingAcceptances.map((acceptance) => <article key={acceptance.pairId}><p>Connection acceptance received.</p><button onClick={() => activateAcceptance(acceptance)}>Activate pairing</button></article>)}</div><form className="send-form" onSubmit={sendFile}><label>Send to<select value={selectedPeer} onChange={(event) => setSelectedPeer(event.target.value)}><option value="">Choose a paired server</option>{activePeers.map((peer) => <option value={peer.pairId} key={peer.pairId}>{peer.targetUrl}</option>)}</select></label><label>Message title<input required maxLength="120" value={messageTitle} onChange={(event) => setMessageTitle(event.target.value)} placeholder="Title" /></label><label>Message<textarea maxLength="2000" value={messageText} onChange={(event) => setMessageText(event.target.value)} placeholder="Optional encrypted note" /></label><input required type="file" onChange={(event) => setSelectedFile(event.target.files[0])} /><button>Encrypt and send</button></form><div className="files">{received.map((record) => <article className="file-message" key={record.encryptedId}><button className="download-message" onClick={() => download(record)}><strong>{record.message?.title || record.message?.name || 'Encrypted file'}</strong>{record.message?.text && <span>{record.message.text}</span>}<small>{record.arrivedAt}</small></button><button className="delete-message" type="button" onClick={() => deleteMessage(record)}>Delete</button></article>)}</div></section></section></main>
 }
 
 createRoot(document.getElementById('root')).render(<App />)

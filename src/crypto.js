@@ -70,18 +70,23 @@ async function pairCryptoKey(pairKey, usage) {
   return crypto.subtle.importKey('raw', fromBase64(pairKey), { name: 'AES-GCM' }, false, usage)
 }
 
-export async function encryptFile(pairKey, file, pairId) {
+export async function encryptFile(pairKey, file, pairId, message = {}) {
   const key = await pairCryptoKey(pairKey, ['encrypt'])
   const iv = bytes(12)
   const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv, additionalData: encode(pairId) }, key, await file.arrayBuffer())
   const metadataIv = bytes(12)
-  const metadata = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: metadataIv, additionalData: encode(pairId) }, key, encode({ name: file.name, type: file.type, size: file.size }))
+  const metadata = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: metadataIv, additionalData: encode(pairId) }, key, encode({ name: file.name, type: file.type, size: file.size, title: String(message.title || ''), text: String(message.text || '') }))
   return { ciphertext: new Blob([encrypted], { type: 'application/octet-stream' }), iv: toBase64(iv), metadata: toBase64(metadata), metadataIv: toBase64(metadataIv) }
+}
+
+export async function decryptMessageMetadata(pairKey, pairId, record) {
+  const key = await pairCryptoKey(pairKey, ['decrypt'])
+  return JSON.parse(decoder.decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromBase64(record.metadataIv), additionalData: encode(pairId) }, key, fromBase64(record.metadata))))
 }
 
 export async function decryptFile(pairKey, pairId, record, ciphertext) {
   const key = await pairCryptoKey(pairKey, ['decrypt'])
-  const metadata = JSON.parse(decoder.decode(await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromBase64(record.metadataIv), additionalData: encode(pairId) }, key, fromBase64(record.metadata))))
+  const metadata = await decryptMessageMetadata(pairKey, pairId, record)
   const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromBase64(record.iv), additionalData: encode(pairId) }, key, await ciphertext.arrayBuffer())
   return { metadata, blob: new Blob([plain], { type: metadata.type || 'application/octet-stream' }) }
 }

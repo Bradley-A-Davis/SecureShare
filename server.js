@@ -215,6 +215,25 @@ app.get('/api/peers/:pairId/files', async (req, res, next) => {
   catch (error) { if (error.code === 'ENOENT') return res.status(404).json({ error: 'Unknown pairing.' }); next(error) }
 })
 
+app.delete('/api/peers/:pairId/files/:encryptedId', async (req, res, next) => {
+  try {
+    const encryptedId = id(req.params.encryptedId)
+    if (!encryptedId) return res.status(400).json({ error: 'A valid encrypted file ID is required.' })
+    const folder = peerFolder(req.params.pairId)
+    const indexPath = path.join(folder, 'encrypted-index.json')
+    const index = JSON.parse(await fs.readFile(indexPath, 'utf8'))
+    const record = index.find((entry) => entry.encryptedId === encryptedId)
+    if (!record) return res.status(404).json({ error: 'Encrypted file not found.' })
+    const storedName = path.basename(record.storedName || '')
+    if (!storedName || storedName !== `${encryptedId}.bin`) return res.status(500).json({ error: 'Stored file record is invalid.' })
+    try { await fs.unlink(path.join(folder, storedName)) }
+    catch (error) { if (error.code !== 'ENOENT') throw error }
+    await fs.writeFile(indexPath, `${JSON.stringify(index.filter((entry) => entry.encryptedId !== encryptedId), null, 2)}\n`, { mode: 0o600 })
+    await fs.appendFile(path.join(folder, 'arrival-log.txt'), `encrypted_deleted_at=${now()} encrypted_id=${encryptedId}\n`)
+    res.json({ deleted: true })
+  } catch (error) { next(error) }
+})
+
 app.get('/api/peers/:pairId/files/:encryptedId', async (req, res) => {
   const fileName = `${id(req.params.encryptedId)}.bin`
   const target = path.join(peerFolder(req.params.pairId), fileName)
