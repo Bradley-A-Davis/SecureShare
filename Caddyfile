@@ -1,0 +1,23 @@
+# TLS terminates here. The Node application is reachable only on the private
+# Compose network, where Caddy proxies requests to it over HTTP. HTTP/3 is
+# intentionally disabled because a configurable host-port cannot safely be
+# advertised in Alt-Svc from this fixed container listener.
+{
+	auto_https disable_redirects
+	servers :23456 {
+		protocols h1 h2
+	}
+}
+
+https://{$SECURESHARE_HOST}:23456 {
+	# Explicitly retain the current secure protocol floor and ceiling.
+	tls /etc/caddy/tls/cert.pem /etc/caddy/tls/key.pem {
+		protocols tls1.2 tls1.3
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+	}
+
+	reverse_proxy secureshare:23456
+}

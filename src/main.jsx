@@ -38,6 +38,7 @@ function App() {
   const [selectedPeer, setSelectedPeer] = useState('')
   const [selectedFile, setSelectedFile] = useState(null)
   const [received, setReceived] = useState([])
+  const [publicUrl, setPublicUrl] = useState('')
 
   const persistPeers = async (next) => { setPeers(next); await savePeers(session.key, next) }
   const refreshEncryptedMessages = async (activeSession = session) => {
@@ -48,9 +49,12 @@ function App() {
     setAcceptances((await Promise.all(pendingAcceptances.map(decode))).filter(Boolean))
   }
   const unlock = async (password, isSetup) => {
+    const configuration = await api('/api/config')
+    if (!configuration.publicUrl) throw new Error('This server needs PUBLIC_URL set to its externally reachable HTTPS address.')
     const nextSession = isSetup ? await setupIdentity(password) : await unlockIdentity(password)
     await api('/api/identity', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ publicKey: nextSession.publicKey, fingerprint: nextSession.fingerprint }) })
     setSession(nextSession)
+    setPublicUrl(configuration.publicUrl)
     setPeers(await loadPeers(nextSession.key))
     await refreshEncryptedMessages(nextSession)
   }
@@ -70,8 +74,8 @@ function App() {
       const pairId = crypto.randomUUID()
       const provision = await api('/api/peers/provision', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pairId, peerUrl: url, peerFingerprint: target.fingerprint }) })
       const pairKey = createPairKey()
-      const ciphertext = await encryptForPublicKey(target.publicKey, { v: 1, p: pairId, u: location.origin, k: pairKey, t: provision.inboundToken, n: note.slice(0, 80) })
-      const response = await fetch(remote(url, '/api/invitations'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pairId, sourceUrl: location.origin, sourceFingerprint: session.fingerprint, ciphertext }) })
+      const ciphertext = await encryptForPublicKey(target.publicKey, { v: 1, p: pairId, u: publicUrl, k: pairKey, t: provision.inboundToken, n: note.slice(0, 80) })
+      const response = await fetch(remote(url, '/api/invitations'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pairId, sourceUrl: publicUrl, sourceFingerprint: session.fingerprint, ciphertext }) })
       if (!response.ok) throw new Error((await response.json()).error || 'Invitation delivery failed.')
       await persistPeers([...peers, { pairId, targetUrl: url, targetFingerprint: target.fingerprint, pairKey, status: 'invited' }])
       setTargetUrl(''); setNote(''); setNotice('Encrypted invitation delivered and awaiting confirmation.')
@@ -84,8 +88,8 @@ function App() {
       const source = await (await fetch(remote(invite.sourceUrl, '/api/public-key'))).json()
       if (source.fingerprint !== invite.sourceFingerprint) throw new Error('The public-key fingerprint does not match the invitation.')
       const provision = await api('/api/peers/provision', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pairId: invite.payload.p, peerUrl: invite.sourceUrl, peerFingerprint: invite.sourceFingerprint }) })
-      const ciphertext = await encryptForPublicKey(source.publicKey, { v: 1, p: invite.payload.p, u: location.origin, t: provision.inboundToken })
-      const response = await fetch(remote(invite.sourceUrl, '/api/acceptances'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pairId: invite.payload.p, sourceUrl: location.origin, sourceFingerprint: session.fingerprint, ciphertext }) })
+      const ciphertext = await encryptForPublicKey(source.publicKey, { v: 1, p: invite.payload.p, u: publicUrl, t: provision.inboundToken })
+      const response = await fetch(remote(invite.sourceUrl, '/api/acceptances'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pairId: invite.payload.p, sourceUrl: publicUrl, sourceFingerprint: session.fingerprint, ciphertext }) })
       if (!response.ok) throw new Error('Acceptance delivery failed.')
       await api(`/api/peers/${invite.payload.p}/activate`, { method: 'POST' })
       await persistPeers([...peers.filter((peer) => peer.pairId !== invite.payload.p), { pairId: invite.payload.p, targetUrl: invite.sourceUrl, targetFingerprint: invite.sourceFingerprint, pairKey: invite.payload.k, uploadToken: invite.payload.t, status: 'active' }])

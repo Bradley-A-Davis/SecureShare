@@ -7,6 +7,7 @@ import multer from 'multer'
 
 const app = express()
 const port = Number(process.env.PORT || 23456)
+const publicUrl = String(process.env.PUBLIC_URL || '').replace(/\/$/, '')
 const root = path.resolve(process.env.INBOX_DIR || path.join(process.cwd(), 'inbox'))
 const statePath = path.join(root, 'server-state.json')
 const invitesPath = path.join(root, '_invitations')
@@ -14,6 +15,12 @@ const acceptancesPath = path.join(root, '_acceptances')
 const peersPath = path.join(root, '_peers')
 const now = () => new Date().toISOString()
 const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex')
+
+if (publicUrl) {
+  let parsedPublicUrl
+  try { parsedPublicUrl = new URL(publicUrl) } catch { throw new Error('PUBLIC_URL must be a valid HTTPS URL.') }
+  if (parsedPublicUrl.protocol !== 'https:') throw new Error('PUBLIC_URL must use HTTPS.')
+}
 
 function id(value) {
   return String(value || '').replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 80)
@@ -61,6 +68,7 @@ await fs.mkdir(root, { recursive: true, mode: 0o700 })
 await Promise.all([fs.mkdir(invitesPath, { recursive: true, mode: 0o700 }), fs.mkdir(acceptancesPath, { recursive: true, mode: 0o700 }), fs.mkdir(peersPath, { recursive: true, mode: 0o700 })])
 
 app.disable('x-powered-by')
+app.set('trust proxy', process.env.TRUST_PROXY === '1' ? 1 : false)
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff')
   res.setHeader('X-Frame-Options', 'DENY')
@@ -75,7 +83,8 @@ app.use((req, res, next) => {
 })
 app.use(express.json({ limit: '256kb' }))
 
-app.get('/api/health', async (_req, res) => res.json({ ok: true, port }))
+app.get('/api/health', async (_req, res) => res.json({ ok: true, port, publicUrl: publicUrl || null }))
+app.get('/api/config', async (_req, res) => res.json({ publicUrl: publicUrl || null }))
 app.get('/api/public-key', async (_req, res, next) => {
   try {
     const { identity } = await readState()
@@ -131,7 +140,7 @@ app.post('/api/peers/provision', async (req, res, next) => {
     const pairId = id(req.body?.pairId)
     const peerUrl = String(req.body?.peerUrl || '').replace(/\/$/, '')
     const peerFingerprint = String(req.body?.peerFingerprint || '').toLowerCase()
-    if (!pairId || !/^https?:\/\//.test(peerUrl) || !/^[a-f0-9]{64}$/.test(peerFingerprint)) return res.status(400).json({ error: 'Invalid pairing details.' })
+    if (!pairId || !/^https:\/\//.test(peerUrl) || !/^[a-f0-9]{64}$/.test(peerFingerprint)) return res.status(400).json({ error: 'Invalid pairing details.' })
     const state = await readState()
     if (state.peers.some((peer) => peer.pairId === pairId)) return res.status(409).json({ error: 'This pairing already exists.' })
     const inboundToken = crypto.randomBytes(32).toString('base64url')
