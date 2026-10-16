@@ -1,13 +1,11 @@
 services:
   secureshare:
     build: .
-    expose:
-      - "23456"
+    ports:
+      - "${SECURESHARE_PORT:-23456}:23456"
     environment:
       PORT: "23456"
       INBOX_DIR: /app/inbox
-      PUBLIC_URL: "${PUBLIC_URL:?Set PUBLIC_URL to this server's externally reachable HTTPS URL}"
-      TRUST_PROXY: "1"
     volumes:
       - ./inbox:/app/inbox
     restart: unless-stopped
@@ -21,23 +19,3 @@ services:
       timeout: 5s
       retries: 3
       start_period: 10s
-
-  caddy:
-    image: caddy:2.10-alpine
-    depends_on:
-      secureshare:
-        condition: service_healthy
-    environment:
-      SECURESHARE_HOST: "${SECURESHARE_HOST:?Set SECURESHARE_HOST to the certificate hostname}"
-    ports:
-      - "${SECURESHARE_HTTPS_PORT:-23456}:23456"
-    volumes:
-      - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - "${SECURESHARE_TLS_DIR:-./tls}:/etc/caddy/tls:ro"
-      - caddy_data:/data
-      - caddy_config:/config
-    restart: unless-stopped
-
-volumes:
-  caddy_data:
-  caddy_config:
