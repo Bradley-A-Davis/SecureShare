@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
-import { createPairKey, decryptFile, decryptFromPrivateKey, decryptMessageMetadata, encryptFile, encryptForPublicKey, hasLocalIdentity, loadPeers, savePeers, saveServerCredential, setupIdentity, unlockIdentity } from './crypto'
+import { createPairKey, createPeerAuthorization, decryptFile, decryptFromPrivateKey, decryptMessageMetadata, encryptFile, encryptForPublicKey, hasLocalIdentity, loadPeers, savePeers, saveServerCredential, setupIdentity, unlockIdentity } from './crypto'
 import './styles.css'
 
 const api = async (path, options = {}) => {
@@ -10,6 +10,7 @@ const api = async (path, options = {}) => {
   return result
 }
 const remote = (url, path) => `${url.replace(/\/$/, '')}${path}`
+const canonicalPeerUrl = (value) => new URL(value).href.replace(/\/$/, '')
 
 function LockScreen({ onUnlock }) {
   const [password, setPassword] = useState('')
@@ -56,11 +57,22 @@ function App() {
   const unlock = async (password, isSetup, setupCredential) => {
     const nextSession = isSetup ? await setupIdentity(password) : await unlockIdentity(password)
     const headers = { 'Content-Type': 'application/json', ...(nextSession.serverCredential ? { Authorization: `Bearer ${nextSession.serverCredential}` } : {}), ...(setupCredential ? { 'X-Setup-Token': setupCredential } : {}) }
-    const registration = await api('/api/identity', { method: 'PUT', headers, body: JSON.stringify({ publicKey: nextSession.publicKey, fingerprint: nextSession.fingerprint }) })
+    const registration = await api('/api/identity', { method: 'PUT', headers, body: JSON.stringify({ publicKey: nextSession.publicKey, fingerprint: nextSession.fingerprint, ownerVerificationKey: nextSession.ownerVerificationKey }) })
     if (registration.adminToken) { await saveServerCredential(nextSession.key, registration.adminToken); nextSession.serverCredential = registration.adminToken }
     if (!nextSession.serverCredential) throw new Error('This browser does not hold the server administrator credential.')
     setSession(nextSession)
-    setPeers(await loadPeers(nextSession.key))
+    const savedPeers = await loadPeers(nextSession.key)
+    // Legacy pairings remain inert until the owner unlocks this identity and
+    // signs their exact stored peer details. This avoids silently trusting old
+    // unsigned backend records while preserving pairings the owner can prove.
+    await Promise.all(savedPeers.filter((peer) => peer.status === 'active').map(async (peer) => {
+      try {
+        const details = { pairId: peer.pairId, peerUrl: canonicalPeerUrl(peer.targetUrl), peerFingerprint: peer.targetFingerprint }
+        const [provisionAuthorization, activationAuthorization] = await Promise.all([createPeerAuthorization(nextSession, 'provision', details), createPeerAuthorization(nextSession, 'activate', details)])
+        await api(`/api/peers/${peer.pairId}/authorize-legacy`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${nextSession.serverCredential}` }, body: JSON.stringify({ provisionAuthorization, activationAuthorization }) })
+      } catch { /* New pairings and absent remote records need no migration. */ }
+    }))
+    setPeers(savedPeers)
     await refreshEncryptedMessages(nextSession)
   }
   useEffect(() => { if (session) refreshEncryptedMessages() }, [session])
@@ -86,11 +98,12 @@ function App() {
   const invitePeer = async (event) => {
     event.preventDefault(); setNotice('')
     try {
-      const url = targetUrl.replace(/\/$/, '')
+      const url = canonicalPeerUrl(targetUrl)
       const target = await (await fetch(remote(url, '/api/public-key'))).json()
       if (!target.publicKey) throw new Error(target.error || 'The target has no public key.')
       const pairId = crypto.randomUUID()
-      const provision = await api('/api/peers/provision', { method: 'POST', headers: { 'Content-Type': 'application/json', ...adminHeaders() }, body: JSON.stringify({ pairId, peerUrl: url, peerFingerprint: target.fingerprint }) })
+      const authorization = await createPeerAuthorization(session, 'provision', { pairId, peerUrl: url, peerFingerprint: target.fingerprint })
+      const provision = await api('/api/peers/provision', { method: 'POST', headers: { 'Content-Type': 'application/json', ...adminHeaders() }, body: JSON.stringify({ pairId, peerUrl: url, peerFingerprint: target.fingerprint, authorization }) })
       const pairKey = createPairKey()
       const ciphertext = await encryptForPublicKey(target.publicKey, { v: 1, p: pairId, u: location.origin, k: pairKey, t: provision.inboundToken, n: note.slice(0, 80) })
       const response = await fetch(remote(url, '/api/invitations'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pairId, sourceUrl: location.origin, sourceFingerprint: session.fingerprint, ciphertext }) })
@@ -103,14 +116,17 @@ function App() {
   const confirmInvite = async (invite) => {
     setNotice('')
     try {
-      const source = await (await fetch(remote(invite.sourceUrl, '/api/public-key'))).json()
+      const sourceUrl = canonicalPeerUrl(invite.sourceUrl)
+      const source = await (await fetch(remote(sourceUrl, '/api/public-key'))).json()
       if (source.fingerprint !== invite.sourceFingerprint) throw new Error('The public-key fingerprint does not match the invitation.')
-      const provision = await api('/api/peers/provision', { method: 'POST', headers: { 'Content-Type': 'application/json', ...adminHeaders() }, body: JSON.stringify({ pairId: invite.payload.p, peerUrl: invite.sourceUrl, peerFingerprint: invite.sourceFingerprint }) })
+      const authorization = await createPeerAuthorization(session, 'provision', { pairId: invite.payload.p, peerUrl: sourceUrl, peerFingerprint: invite.sourceFingerprint })
+      const provision = await api('/api/peers/provision', { method: 'POST', headers: { 'Content-Type': 'application/json', ...adminHeaders() }, body: JSON.stringify({ pairId: invite.payload.p, peerUrl: sourceUrl, peerFingerprint: invite.sourceFingerprint, authorization }) })
       const ciphertext = await encryptForPublicKey(source.publicKey, { v: 1, p: invite.payload.p, u: location.origin, t: provision.inboundToken })
       const response = await fetch(remote(invite.sourceUrl, '/api/acceptances'), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pairId: invite.payload.p, sourceUrl: location.origin, sourceFingerprint: session.fingerprint, ciphertext }) })
       if (!response.ok) throw new Error('Acceptance delivery failed.')
-      await api(`/api/peers/${invite.payload.p}/activate`, { method: 'POST', headers: adminHeaders() })
-      await persistPeers([...peers.filter((peer) => peer.pairId !== invite.payload.p), { pairId: invite.payload.p, targetUrl: invite.sourceUrl, targetFingerprint: invite.sourceFingerprint, pairKey: invite.payload.k, uploadToken: invite.payload.t, inboxToken: provision.inboundToken, status: 'active' }])
+      const activation = await createPeerAuthorization(session, 'activate', { pairId: invite.payload.p, peerUrl: sourceUrl, peerFingerprint: invite.sourceFingerprint })
+      await api(`/api/peers/${invite.payload.p}/activate`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...adminHeaders() }, body: JSON.stringify({ authorization: activation }) })
+      await persistPeers([...peers.filter((peer) => peer.pairId !== invite.payload.p), { pairId: invite.payload.p, targetUrl: sourceUrl, targetFingerprint: invite.sourceFingerprint, pairKey: invite.payload.k, uploadToken: invite.payload.t, inboxToken: provision.inboundToken, status: 'active' }])
       try { await api(`/api/invitations/${invite.pairId}`, { method: 'DELETE', headers: adminHeaders() }) } catch { /* The active pairing also suppresses a stale request. */ }
       setInvites((current) => current.filter((entry) => entry.pairId !== invite.pairId)); setNotice('Pairing confirmed. This peer can now exchange encrypted files.')
     } catch (failure) { setNotice(failure.message) }
@@ -120,7 +136,8 @@ function App() {
     const pending = peers.find((peer) => peer.pairId === acceptance.payload.p)
     if (!pending) return setNotice('This acceptance does not match a local invitation.')
     try {
-      await api(`/api/peers/${pending.pairId}/activate`, { method: 'POST', headers: adminHeaders() })
+      const activation = await createPeerAuthorization(session, 'activate', { pairId: pending.pairId, peerUrl: canonicalPeerUrl(pending.targetUrl), peerFingerprint: pending.targetFingerprint })
+      await api(`/api/peers/${pending.pairId}/activate`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...adminHeaders() }, body: JSON.stringify({ authorization: activation }) })
       await persistPeers(peers.map((peer) => peer.pairId === pending.pairId ? { ...peer, targetUrl: acceptance.payload.u, uploadToken: acceptance.payload.t, status: 'active' } : peer))
       try { await api(`/api/acceptances/${acceptance.pairId}`, { method: 'DELETE', headers: adminHeaders() }) } catch { /* The active pairing also suppresses a stale request. */ }
       setAcceptances((current) => current.filter((entry) => entry.pairId !== acceptance.pairId)); setNotice('Pairing activated.')

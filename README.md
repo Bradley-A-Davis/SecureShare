@@ -38,7 +38,7 @@ The bind mount is required for persistent encrypted inbox data.
 4. The recipient unlocks the page, verifies the source URL and public-key fingerprint, then confirms. Both local clients retain the pair AES key encrypted under their local password key.
 5. Files are encrypted in the browser with AES-256-GCM before upload. The receiving server stores only ciphertext, encrypted metadata, checksums, and arrival metadata in `inbox/_peers/<pair-id>/`.
 
-The server never receives a private key, password, plaintext file, or plaintext filename. Administrator and pairing transport credentials are stored only as hashes on the server. Set `NODE_ENV=production` behind HTTPS; startup refuses to run without `SECURESHARE_SETUP_TOKEN`, and production rejects non-HTTPS peer URLs.
+The server never receives a private key, password, plaintext file, or plaintext filename. Administrator and pairing transport credentials are stored only as hashes on the server. Set `NODE_ENV=production` behind HTTPS; an uninitialized server requires `SECURESHARE_SETUP_TOKEN` when it performs identity setup, and production rejects non-HTTPS peer URLs.
 
 ## Public endpoints
 

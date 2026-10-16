@@ -17,12 +17,11 @@ const MAX_PENDING_UPLOADS = Number(process.env.MAX_PENDING_UPLOADS || 4)
 const MAX_TOTAL_PENDING_UPLOADS = Number(process.env.MAX_TOTAL_PENDING_UPLOADS || 12)
 const MAX_PENDING_PAIRINGS = Number(process.env.MAX_PENDING_PAIRINGS || 20)
 const PAIRING_TTL_MS = Number(process.env.PAIRING_TTL_MS || 24 * 60 * 60 * 1000)
+const AUTHORIZATION_MAX_AGE_MS = 10 * 60 * 1000
 const now = () => new Date().toISOString()
 const sha256 = (value) => crypto.createHash('sha256').update(value).digest('hex')
 const tokenHash = (value) => crypto.createHash('sha256').update(value).digest('hex')
 const setupToken = process.env.SECURESHARE_SETUP_TOKEN
-
-if (!setupToken) throw new Error('SECURESHARE_SETUP_TOKEN must be set before SecureShare starts.')
 
 function safeId(value) { const input = String(value || ''); return /^[A-Za-z0-9_-]{16,80}$/.test(input) ? input : null }
 function tokenEquals(expectedHash, supplied) {
@@ -30,6 +29,7 @@ function tokenEquals(expectedHash, supplied) {
   const left = Buffer.from(expectedHash, 'hex'); const right = Buffer.from(tokenHash(supplied), 'hex')
   return left.length === right.length && crypto.timingSafeEqual(left, right)
 }
+function validSetupCredential(supplied) { return Boolean(setupToken) && tokenEquals(tokenHash(setupToken), supplied) }
 function bearer(req) { return req.get('authorization')?.match(/^Bearer\s+([A-Za-z0-9_-]{20,512})$/i)?.[1] || null }
 function originOf(value) { try { return new URL(value).origin } catch { return null } }
 function isSafeUrl(value) {
@@ -47,7 +47,26 @@ function validEnvelope(value) {
 }
 function validB64(value, limit) { return typeof value === 'string' && value.length > 0 && value.length <= limit && /^[A-Za-z0-9+/]+={0,2}$/.test(value) }
 function expired(value) { return !value?.expiresAt || Date.parse(value.expiresAt) <= Date.now() }
-async function readState() { try { const state = JSON.parse(await fs.readFile(statePath, 'utf8')); return { version: 3, identity: state.identity || null, peers: Array.isArray(state.peers) ? state.peers : [] } } catch (error) { if (error.code === 'ENOENT') return { version: 3, identity: null, peers: [] }; throw error } }
+function validVerificationKey(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || value.kty !== 'EC' || value.crv !== 'P-256' || !/^[A-Za-z0-9_-]{40,100}$/.test(value.x || '') || !/^[A-Za-z0-9_-]{40,100}$/.test(value.y || '')) return false
+  try { crypto.createPublicKey({ key: value, format: 'jwk' }); return true } catch { return false }
+}
+function authorizationMessage({ action, pairId, peerFingerprint, peerUrl, nonce, issuedAt, ownerFingerprint }) { return JSON.stringify({ v: 1, action, pairId, peerFingerprint, peerUrl, nonce, issuedAt, ownerFingerprint }) }
+function validAuthorizationShape(value) {
+  return value && typeof value === 'object' && value.v === 1 && ['provision', 'activate', 'revoke'].includes(value.action) && safeId(value.pairId) && /^[a-f0-9]{64}$/.test(String(value.peerFingerprint || '')) && isSafeUrl(value.peerUrl) && /^[A-Za-z0-9-]{32,80}$/.test(String(value.nonce || '')) && Number.isFinite(Date.parse(value.issuedAt)) && /^[a-f0-9]{64}$/.test(String(value.ownerFingerprint || '')) && validB64(value.signature, 256)
+}
+function authorizationDigest(value) { return sha256(JSON.stringify(value)) }
+function verifiesAuthorization(identity, authorization, expected, requireFresh = false) {
+  if (!identity?.ownerVerificationKey || !validAuthorizationShape(authorization) || authorization.action !== expected.action || authorization.pairId !== expected.pairId || authorization.peerFingerprint !== expected.peerFingerprint || authorization.peerUrl !== expected.peerUrl || authorization.ownerFingerprint !== identity.fingerprint || (requireFresh && Math.abs(Date.now() - Date.parse(authorization.issuedAt)) > AUTHORIZATION_MAX_AGE_MS)) return false
+  try { return crypto.verify('sha256', Buffer.from(authorizationMessage(authorization)), { key: crypto.createPublicKey({ key: identity.ownerVerificationKey, format: 'jwk' }), dsaEncoding: 'ieee-p1363' }, Buffer.from(authorization.signature, 'base64')) } catch { return false }
+}
+function isRevoked(state, pairId) { return Boolean(state.revokedPairs?.[pairId]) }
+function trustedPeer(state, peer) {
+  if (!peer || peer.status !== 'active' || isRevoked(state, peer.pairId)) return false
+  const expected = { pairId: peer.pairId, peerFingerprint: peer.peerFingerprint, peerUrl: peer.peerUrl }
+  return verifiesAuthorization(state.identity, peer.authorizations?.provision, { ...expected, action: 'provision' }) && verifiesAuthorization(state.identity, peer.authorizations?.activate, { ...expected, action: 'activate' })
+}
+async function readState() { try { const state = JSON.parse(await fs.readFile(statePath, 'utf8')); return { ...state, version: 4, identity: state.identity || null, peers: Array.isArray(state.peers) ? state.peers : [], usedAuthorizations: state.usedAuthorizations && typeof state.usedAuthorizations === 'object' ? state.usedAuthorizations : {}, revokedPairs: state.revokedPairs && typeof state.revokedPairs === 'object' ? state.revokedPairs : {} } } catch (error) { if (error.code === 'ENOENT') return { version: 4, identity: null, peers: [], usedAuthorizations: {}, revokedPairs: {} }; throw error } }
 async function writeState(state) { const temp = `${statePath}.${process.pid}.${crypto.randomUUID()}.tmp`; await fs.writeFile(temp, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 }); await fs.rename(temp, statePath) }
 function peerFolder(pairId) { return path.join(peersPath, pairId) }
 async function readIndex(pairId) { return JSON.parse(await fs.readFile(path.join(peerFolder(pairId), 'encrypted-index.json'), 'utf8')) }
@@ -84,28 +103,40 @@ app.use((req, res, next) => {
 })
 app.use(express.json({ limit: '32kb', strict: true }))
 async function authorizeAdmin(req, res, next) { try { const identity = (await readState()).identity; if (!identity || !tokenEquals(identity.adminTokenHash, bearer(req))) return res.status(401).json({ error: 'Administrator authorization is required.' }); req.admin = true; next() } catch (error) { next(error) } }
-async function authorizePeer(req, res, next) { try { const pairId = safeId(req.params.pairId); const peer = (await readState()).peers.find((entry) => entry.pairId === pairId); if (!pairId || !peer || peer.status !== 'active' || !tokenEquals(peer.inboundTokenHash, bearer(req))) return res.status(401).json({ error: 'Invalid or inactive peer credential.' }); req.peer = peer; next() } catch (error) { next(error) } }
+async function authorizePeer(req, res, next) { try { const pairId = safeId(req.params.pairId); const state = await readState(); const peer = state.peers.find((entry) => entry.pairId === pairId); if (!pairId || !trustedPeer(state, peer) || !tokenEquals(peer.inboundTokenHash, bearer(req))) return res.status(401).json({ error: 'Invalid or inactive peer credential.' }); req.peer = peer; next() } catch (error) { next(error) } }
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, port }))
 app.get('/api/public-key', async (_req, res, next) => { try { const { identity } = await readState(); if (!identity) return res.status(503).json({ error: 'This server has not completed local key setup.' }); res.json({ publicKey: identity.publicKey, fingerprint: identity.fingerprint }) } catch (error) { next(error) } })
 app.put('/api/identity', rateLimit({ windowMs: 60_000, max: 5 }), async (req, res, next) => {
   try {
-    const { publicKey, fingerprint } = req.body || {}
-    if (!publicKey || typeof publicKey !== 'object' || Array.isArray(publicKey) || !/^[a-f0-9]{64}$/i.test(String(fingerprint || '')) || JSON.stringify(publicKey).length > 16000 || publicKey.kty !== 'RSA' || typeof publicKey.n !== 'string' || typeof publicKey.e !== 'string' || sha256(JSON.stringify(publicKey)) !== String(fingerprint).toLowerCase()) return res.status(400).json({ error: 'A valid public key and fingerprint are required.' })
+    const { publicKey, fingerprint, ownerVerificationKey } = req.body || {}
+    if (!publicKey || typeof publicKey !== 'object' || Array.isArray(publicKey) || !/^[a-f0-9]{64}$/i.test(String(fingerprint || '')) || JSON.stringify(publicKey).length > 16000 || publicKey.kty !== 'RSA' || typeof publicKey.n !== 'string' || typeof publicKey.e !== 'string' || sha256(JSON.stringify(publicKey)) !== String(fingerprint).toLowerCase() || (ownerVerificationKey !== undefined && !validVerificationKey(ownerVerificationKey))) return res.status(400).json({ error: 'A valid public key, fingerprint, and owner verification key are required.' })
     const state = await readState()
     if (state.identity) {
       if (state.identity.fingerprint !== String(fingerprint).toLowerCase()) return res.status(409).json({ error: 'A server identity already exists.' })
       if (!state.identity.adminTokenHash) {
-        if (!tokenEquals(tokenHash(setupToken), req.get('x-setup-token') || '')) return res.status(401).json({ error: 'A setup credential is required to recover administrator access.' })
+        if (!setupToken) return res.status(503).json({ error: 'Server setup credential is not configured.' })
+        if (!validSetupCredential(req.get('x-setup-token') || '')) return res.status(401).json({ error: 'A setup credential is required to recover administrator access.' })
+        if (!state.identity.ownerVerificationKey) {
+          if (!ownerVerificationKey) return res.status(409).json({ error: 'This legacy identity must register an owner verification key.' })
+          state.identity.ownerVerificationKey = ownerVerificationKey
+        } else if (ownerVerificationKey && JSON.stringify(ownerVerificationKey) !== JSON.stringify(state.identity.ownerVerificationKey)) return res.status(409).json({ error: 'The registered owner verification key cannot be changed.' })
         const adminToken = crypto.randomBytes(32).toString('base64url')
         state.identity.adminTokenHash = tokenHash(adminToken); await writeState(state)
         return res.json({ publicKey: state.identity.publicKey, fingerprint: state.identity.fingerprint, adminToken })
       }
       if (!tokenEquals(state.identity.adminTokenHash, bearer(req))) return res.status(401).json({ error: 'Administrator authorization is required.' })
+      if (!state.identity.ownerVerificationKey) {
+        if (!ownerVerificationKey) return res.status(409).json({ error: 'This legacy identity must register an owner verification key.' })
+        state.identity.ownerVerificationKey = ownerVerificationKey
+        await writeState(state)
+      } else if (ownerVerificationKey && JSON.stringify(ownerVerificationKey) !== JSON.stringify(state.identity.ownerVerificationKey)) return res.status(409).json({ error: 'The registered owner verification key cannot be changed.' })
       return res.json({ publicKey: state.identity.publicKey, fingerprint: state.identity.fingerprint })
     }
-    if (!tokenEquals(tokenHash(setupToken), req.get('x-setup-token') || '')) return res.status(401).json({ error: 'A valid setup credential is required.' })
-    const adminToken = crypto.randomBytes(32).toString('base64url'); state.identity = { publicKey, fingerprint: String(fingerprint).toLowerCase(), adminTokenHash: tokenHash(adminToken), createdAt: now() }; await writeState(state); res.status(201).json({ publicKey, fingerprint: state.identity.fingerprint, adminToken })
+    if (!setupToken) return res.status(503).json({ error: 'Server setup credential is not configured.' })
+    if (!validSetupCredential(req.get('x-setup-token') || '')) return res.status(401).json({ error: 'A valid setup credential is required.' })
+    if (!ownerVerificationKey) return res.status(400).json({ error: 'An owner verification key is required.' })
+    const adminToken = crypto.randomBytes(32).toString('base64url'); state.identity = { publicKey, fingerprint: String(fingerprint).toLowerCase(), ownerVerificationKey, adminTokenHash: tokenHash(adminToken), createdAt: now() }; await writeState(state); res.status(201).json({ publicKey, fingerprint: state.identity.fingerprint, adminToken })
   } catch (error) { next(error) }
 })
 app.get('/api/invitations', authorizeAdmin, async (_req, res, next) => { try { res.json(await readEnvelopes(invitesPath)) } catch (error) { next(error) } })
@@ -115,9 +146,24 @@ app.get('/api/acceptances', authorizeAdmin, async (_req, res, next) => { try { r
 app.post('/api/acceptances', unauthPairLimit, async (req, res, next) => { try { if (!validEnvelope(req.body)) { const error = new Error('Invalid pairing request.'); error.status = 400; throw error }; const peer = (await readState()).peers.find((entry) => entry.pairId === req.body.pairId); if (!peer || peer.status !== 'provisioned' || peer.peerFingerprint !== req.body.sourceFingerprint.toLowerCase() || expired(peer)) return res.status(403).json({ error: 'This pairing is not awaiting an acceptance.' }); await storeEnvelope(acceptancesPath, req.body); res.status(202).json({ accepted: true }) } catch (error) { next(error) } })
 app.delete('/api/acceptances/:pairId', authorizeAdmin, async (req, res, next) => { try { await deleteEnvelope(acceptancesPath, req.params.pairId); res.json({ deleted: true }) } catch (error) { next(error) } })
 app.post('/api/peers/provision', adminLimit, authorizeAdmin, async (req, res, next) => {
-  try { const pairId = safeId(req.body?.pairId); const peerUrl = isSafeUrl(req.body?.peerUrl); const peerFingerprint = String(req.body?.peerFingerprint || '').toLowerCase(); if (!pairId || !peerUrl || !/^[a-f0-9]{64}$/.test(peerFingerprint)) return res.status(400).json({ error: 'Invalid pairing details.' }); const state = await readState(); if (state.peers.some((peer) => peer.pairId === pairId)) return res.status(409).json({ error: 'This pairing already exists.' }); const inboundToken = crypto.randomBytes(32).toString('base64url'); const createdAt = now(); const expiresAt = new Date(Date.now() + PAIRING_TTL_MS).toISOString(); state.peers.push({ pairId, peerUrl, peerFingerprint, inboundTokenHash: tokenHash(inboundToken), status: 'provisioned', approvedAt: createdAt, expiresAt, createdAt }); await fs.mkdir(peerFolder(pairId), { recursive: false, mode: 0o700 }); await fs.writeFile(path.join(peerFolder(pairId), 'arrival-log.txt'), `SecureShare encrypted arrival log\npair_id=${pairId}\ncreated_at=${createdAt}\n\n`, { mode: 0o600 }); await fs.writeFile(path.join(peerFolder(pairId), 'encrypted-index.json'), '[]\n', { mode: 0o600 }); await writeState(state); res.status(201).json({ inboundToken, expiresAt }) } catch (error) { next(error) }
+  try {
+    const pairId = safeId(req.body?.pairId); const peerUrl = isSafeUrl(req.body?.peerUrl); const peerFingerprint = String(req.body?.peerFingerprint || '').toLowerCase(); const authorization = req.body?.authorization || req.body?.authorizationProof
+    if (!pairId || !peerUrl || !/^[a-f0-9]{64}$/.test(peerFingerprint)) return res.status(400).json({ error: 'Invalid pairing details.' })
+    const state = await readState(); const expected = { action: 'provision', pairId, peerUrl, peerFingerprint }
+    if (isRevoked(state, pairId)) return res.status(403).json({ error: 'This pairing has been revoked and cannot be reused.' })
+    if (!verifiesAuthorization(state.identity, authorization, expected, true) || state.usedAuthorizations[authorizationDigest(authorization)]) return res.status(403).json({ error: 'A fresh valid owner authorization is required.' })
+    if (state.peers.some((peer) => peer.pairId === pairId)) return res.status(409).json({ error: 'This pairing already exists.' })
+    const inboundToken = crypto.randomBytes(32).toString('base64url'); const createdAt = now(); const expiresAt = new Date(Date.now() + PAIRING_TTL_MS).toISOString()
+    state.usedAuthorizations[authorizationDigest(authorization)] = { action: authorization.action, pairId, usedAt: createdAt }
+    state.peers.push({ pairId, peerUrl, peerFingerprint, inboundTokenHash: tokenHash(inboundToken), status: 'provisioned', approvedAt: createdAt, expiresAt, createdAt, authorizations: { provision: authorization } })
+    await fs.mkdir(peerFolder(pairId), { recursive: false, mode: 0o700 }); await fs.writeFile(path.join(peerFolder(pairId), 'arrival-log.txt'), `SecureShare encrypted arrival log\npair_id=${pairId}\ncreated_at=${createdAt}\n\n`, { mode: 0o600 }); await fs.writeFile(path.join(peerFolder(pairId), 'encrypted-index.json'), '[]\n', { mode: 0o600 }); await writeState(state); res.status(201).json({ inboundToken, expiresAt })
+  } catch (error) { next(error) }
 })
-app.post('/api/peers/:pairId/activate', adminLimit, authorizeAdmin, async (req, res, next) => { try { const pairId = safeId(req.params.pairId); const state = await readState(); const peer = state.peers.find((entry) => entry.pairId === pairId); if (!peer) return res.status(404).json({ error: 'Unknown pairing.' }); if (peer.status !== 'provisioned' || !peer.approvedAt || expired(peer)) return res.status(403).json({ error: 'This pairing is not approved for activation.' }); peer.status = 'active'; peer.activatedAt = now(); delete peer.expiresAt; await writeState(state); res.json({ active: true }) } catch (error) { next(error) } })
+app.post('/api/peers/:pairId/activate', adminLimit, authorizeAdmin, async (req, res, next) => { try { const pairId = safeId(req.params.pairId); const state = await readState(); const peer = state.peers.find((entry) => entry.pairId === pairId); const authorization = req.body?.authorization || req.body?.authorizationProof; if (!peer) return res.status(404).json({ error: 'Unknown pairing.' }); if (peer.status !== 'provisioned' || !peer.approvedAt || expired(peer) || isRevoked(state, pairId)) return res.status(403).json({ error: 'This pairing is not approved for activation.' }); const expected = { action: 'activate', pairId, peerUrl: peer.peerUrl, peerFingerprint: peer.peerFingerprint }; if (!verifiesAuthorization(state.identity, authorization, expected, true) || state.usedAuthorizations[authorizationDigest(authorization)]) return res.status(403).json({ error: 'A fresh valid owner authorization is required.' }); peer.status = 'active'; peer.activatedAt = now(); peer.authorizations = { ...peer.authorizations, activate: authorization }; state.usedAuthorizations[authorizationDigest(authorization)] = { action: authorization.action, pairId, usedAt: peer.activatedAt }; delete peer.expiresAt; await writeState(state); res.json({ active: true }) } catch (error) { next(error) } })
+app.post('/api/peers/:pairId/authorize-legacy', adminLimit, authorizeAdmin, async (req, res, next) => { try { const pairId = safeId(req.params.pairId); const state = await readState(); const peer = state.peers.find((entry) => entry.pairId === pairId); if (!peer) return res.status(404).json({ error: 'Unknown pairing.' }); if (isRevoked(state, pairId) || peer.status !== 'active') return res.status(403).json({ error: 'This peer cannot be migrated.' }); if (trustedPeer(state, peer)) return res.json({ migrated: false }); const expected = { pairId, peerUrl: peer.peerUrl, peerFingerprint: peer.peerFingerprint }; const provisionAuthorization = req.body?.provisionAuthorization; const activationAuthorization = req.body?.activationAuthorization; if (!verifiesAuthorization(state.identity, provisionAuthorization, { ...expected, action: 'provision' }, true) || !verifiesAuthorization(state.identity, activationAuthorization, { ...expected, action: 'activate' }, true) || state.usedAuthorizations[authorizationDigest(provisionAuthorization)] || state.usedAuthorizations[authorizationDigest(activationAuthorization)]) return res.status(403).json({ error: 'Fresh valid owner authorizations are required to migrate this peer.' }); peer.authorizations = { provision: provisionAuthorization, activate: activationAuthorization }; const migratedAt = now(); state.usedAuthorizations[authorizationDigest(provisionAuthorization)] = { action: 'provision', pairId, usedAt: migratedAt }; state.usedAuthorizations[authorizationDigest(activationAuthorization)] = { action: 'activate', pairId, usedAt: migratedAt }; await writeState(state); res.json({ migrated: true }) } catch (error) { next(error) } })
+app.delete('/api/peers/:pairId', adminLimit, authorizeAdmin, async (req, res, next) => { try { const pairId = safeId(req.params.pairId); const state = await readState(); const peer = state.peers.find((entry) => entry.pairId === pairId); const authorization = req.body?.authorization || req.body?.authorizationProof; if (!peer) return res.status(404).json({ error: 'Unknown pairing.' }); const expected = { action: 'revoke', pairId, peerUrl: peer.peerUrl, peerFingerprint: peer.peerFingerprint }; if (!verifiesAuthorization(state.identity, authorization, expected, true) || state.usedAuthorizations[authorizationDigest(authorization)]) return res.status(403).json({ error: 'A fresh valid owner authorization is required.' }); const revokedAt = now(); peer.status = 'revoked'; peer.revokedAt = revokedAt; peer.authorizations = { ...peer.authorizations, revoke: authorization }; state.revokedPairs[pairId] = { revokedAt, authorization }; state.usedAuthorizations[authorizationDigest(authorization)] = { action: authorization.action, pairId, usedAt: revokedAt }; await writeState(state); res.json({ revoked: true }) } catch (error) { next(error) } })
+app.get('/api/peers', authorizeAdmin, async (_req, res, next) => { try { const state = await readState(); res.json(state.peers.filter((peer) => trustedPeer(state, peer)).map(({ inboundTokenHash, ...peer }) => peer)) } catch (error) { next(error) } })
+app.post('/api/peers/cleanup', adminLimit, authorizeAdmin, async (req, res, next) => { try { const pairIds = Array.isArray(req.body?.pairIds) ? req.body.pairIds : []; if (!pairIds.length || !pairIds.every(safeId)) return res.status(400).json({ error: 'Explicit unauthorized peer IDs are required.' }); const state = await readState(); const targets = state.peers.filter((peer) => pairIds.includes(peer.pairId)); if (targets.length !== pairIds.length || targets.some((peer) => trustedPeer(state, peer))) return res.status(409).json({ error: 'Only untrusted peers can be cleaned up.' }); state.peers = state.peers.filter((peer) => !pairIds.includes(peer.pairId)); await Promise.all(pairIds.map((pairId) => fs.rm(peerFolder(pairId), { recursive: true, force: true }))); await writeState(state); res.json({ removed: pairIds }) } catch (error) { next(error) } })
 
 const pendingUploads = new Map()
 let totalPendingUploads = 0

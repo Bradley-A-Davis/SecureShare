@@ -8,6 +8,7 @@ const bytes = (length) => crypto.getRandomValues(new Uint8Array(length))
 const encode = (value) => encoder.encode(typeof value === 'string' ? value : JSON.stringify(value))
 const toBase64 = (value) => btoa(String.fromCharCode(...new Uint8Array(value)))
 const fromBase64 = (value) => Uint8Array.from(atob(value), (character) => character.charCodeAt(0))
+const peerAuthorizationMessage = ({ action, pairId, peerFingerprint, peerUrl, nonce, issuedAt, ownerFingerprint }) => JSON.stringify({ v: 1, action, pairId, peerFingerprint, peerUrl, nonce, issuedAt, ownerFingerprint })
 
 async function masterKey(password, salt) {
   const material = await crypto.subtle.importKey('raw', encode(password), 'PBKDF2', false, ['deriveKey'])
@@ -34,12 +35,17 @@ export async function fingerprint(publicKey) {
 
 export async function setupIdentity(password) {
   const keyPair = await crypto.subtle.generateKey({ name: 'RSA-OAEP', modulusLength: 4096, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-256' }, true, ['encrypt', 'decrypt'])
+  // RSA-OAEP is encryption-only. A distinct signing key authorizes peer changes.
+  const signingKeyPair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify'])
   const publicKey = await crypto.subtle.exportKey('jwk', keyPair.publicKey)
   const privateKey = await crypto.subtle.exportKey('jwk', keyPair.privateKey)
+  const ownerVerificationKey = await crypto.subtle.exportKey('jwk', signingKeyPair.publicKey)
+  const signingPrivateKey = await crypto.subtle.exportKey('jwk', signingKeyPair.privateKey)
   const salt = bytes(16)
   const key = await masterKey(password, salt)
   const encryptedPrivate = await encryptText(key, privateKey)
-  const identity = { version: 1, salt: toBase64(salt), publicKey, encryptedPrivate }
+  const encryptedSigningPrivate = await encryptText(key, signingPrivateKey)
+  const identity = { version: 2, salt: toBase64(salt), publicKey, encryptedPrivate, ownerVerificationKey, encryptedSigningPrivate }
   localStorage.setItem(identityStorage, JSON.stringify(identity))
   return { ...await unlockIdentity(password), created: true }
 }
@@ -50,8 +56,26 @@ export async function unlockIdentity(password) {
   const key = await masterKey(password, fromBase64(stored.salt))
   const privateJwk = JSON.parse(await decryptText(key, stored.encryptedPrivate))
   const privateKey = await crypto.subtle.importKey('jwk', privateJwk, { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['decrypt'])
+  // Upgrade legacy local identities only after their password has unlocked the
+  // existing private material. The new signing private key remains encrypted.
+  if (!stored.ownerVerificationKey || !stored.encryptedSigningPrivate) {
+    const signingKeyPair = await crypto.subtle.generateKey({ name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign', 'verify'])
+    stored.ownerVerificationKey = await crypto.subtle.exportKey('jwk', signingKeyPair.publicKey)
+    stored.encryptedSigningPrivate = await encryptText(key, await crypto.subtle.exportKey('jwk', signingKeyPair.privateKey))
+    stored.version = 2
+    localStorage.setItem(identityStorage, JSON.stringify(stored))
+  }
+  const signingPrivateJwk = JSON.parse(await decryptText(key, stored.encryptedSigningPrivate))
+  const signingPrivateKey = await crypto.subtle.importKey('jwk', signingPrivateJwk, { name: 'ECDSA', namedCurve: 'P-256' }, false, ['sign'])
   const serverCredential = stored.encryptedServerCredential ? await decryptText(key, stored.encryptedServerCredential) : null
-  return { key, privateKey, publicKey: stored.publicKey, fingerprint: await fingerprint(stored.publicKey), serverCredential }
+  return { key, privateKey, signingPrivateKey, ownerVerificationKey: stored.ownerVerificationKey, publicKey: stored.publicKey, fingerprint: await fingerprint(stored.publicKey), serverCredential }
+}
+
+export async function createPeerAuthorization(session, action, { pairId, peerFingerprint, peerUrl }) {
+  if (!['provision', 'activate', 'revoke'].includes(action)) throw new Error('Invalid peer authorization action.')
+  const authorization = { v: 1, action, pairId, peerFingerprint: String(peerFingerprint).toLowerCase(), peerUrl, nonce: crypto.randomUUID(), issuedAt: new Date().toISOString(), ownerFingerprint: session.fingerprint }
+  const signature = await crypto.subtle.sign({ name: 'ECDSA', hash: 'SHA-256' }, session.signingPrivateKey, encode(peerAuthorizationMessage(authorization)))
+  return { ...authorization, signature: toBase64(signature) }
 }
 
 // The server administrator credential is encrypted with the same non-extractable
