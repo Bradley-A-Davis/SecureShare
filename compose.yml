@@ -6,6 +6,7 @@ services:
     environment:
       PORT: "23456"
       INBOX_DIR: /app/inbox
+      SECURESHARE_SETUP_TOKEN: "${SECURESHARE_SETUP_TOKEN:?Set a long random first-run setup credential in your environment}"
     volumes:
       - ./inbox:/app/inbox
     restart: unless-stopped

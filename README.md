@@ -4,11 +4,14 @@ SecureShare is a single-user, server-to-server encrypted file exchange. It liste
 
 ## Start with Docker Compose
 
+Set a long random, single-use setup credential before the first start, then open the HTTPS endpoint in a browser. The credential is required once to bind the server identity and is exchanged for a browser-held administrator credential.
+
 ```bash
+export SECURESHARE_SETUP_TOKEN="$(openssl rand -base64 32)"
 docker compose up --build -d
 ```
 
-Open `http://localhost:23456`. Received encrypted files persist in `./inbox`.
+Received encrypted files persist in `./inbox`.
 
 To stop it:
 
@@ -22,7 +25,7 @@ Set `SECURESHARE_PORT` before starting if the host needs a different port, for e
 
 ```bash
 docker build -t secureshare .
-docker run --rm -p 23456:23456 -v "$(pwd)/inbox:/app/inbox" secureshare
+docker run --rm -e SECURESHARE_SETUP_TOKEN="$SECURESHARE_SETUP_TOKEN" -p 23456:23456 -v "$(pwd)/inbox:/app/inbox" secureshare
 ```
 
 The bind mount is required for persistent encrypted inbox data.
@@ -35,7 +38,7 @@ The bind mount is required for persistent encrypted inbox data.
 4. The recipient unlocks the page, verifies the source URL and public-key fingerprint, then confirms. Both local clients retain the pair AES key encrypted under their local password key.
 5. Files are encrypted in the browser with AES-256-GCM before upload. The receiving server stores only ciphertext, encrypted metadata, checksums, and arrival metadata in `inbox/_peers/<pair-id>/`.
 
-The server never receives a private key, password, plaintext file, or plaintext filename.
+The server never receives a private key, password, plaintext file, or plaintext filename. Administrator and pairing transport credentials are stored only as hashes on the server. Set `NODE_ENV=production` behind HTTPS; startup refuses to run without `SECURESHARE_SETUP_TOKEN`, and production rejects non-HTTPS peer URLs.
 
 ## Public endpoints
 

@@ -50,7 +50,18 @@ export async function unlockIdentity(password) {
   const key = await masterKey(password, fromBase64(stored.salt))
   const privateJwk = JSON.parse(await decryptText(key, stored.encryptedPrivate))
   const privateKey = await crypto.subtle.importKey('jwk', privateJwk, { name: 'RSA-OAEP', hash: 'SHA-256' }, false, ['decrypt'])
-  return { key, privateKey, publicKey: stored.publicKey, fingerprint: await fingerprint(stored.publicKey) }
+  const serverCredential = stored.encryptedServerCredential ? await decryptText(key, stored.encryptedServerCredential) : null
+  return { key, privateKey, publicKey: stored.publicKey, fingerprint: await fingerprint(stored.publicKey), serverCredential }
+}
+
+// The server administrator credential is encrypted with the same non-extractable
+// password-derived key as the local peer list. It is never sent to another peer.
+export async function saveServerCredential(key, credential) {
+  if (typeof credential !== 'string' || credential.length < 20) throw new Error('Invalid server credential.')
+  const stored = JSON.parse(localStorage.getItem(identityStorage) || 'null')
+  if (!stored) throw new Error('No local identity is configured.')
+  stored.encryptedServerCredential = await encryptText(key, credential)
+  localStorage.setItem(identityStorage, JSON.stringify(stored))
 }
 
 export async function encryptForPublicKey(publicJwk, value) {
