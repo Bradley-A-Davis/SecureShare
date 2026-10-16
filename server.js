@@ -25,6 +25,10 @@ function tokenEquals(expectedHash, supplied) {
   return left.length === right.length && crypto.timingSafeEqual(left, right)
 }
 
+function originOf(value) {
+  try { return new URL(value).origin } catch { return null }
+}
+
 async function readState() {
   try { return JSON.parse(await fs.readFile(statePath, 'utf8')) }
   catch (error) { if (error.code === 'ENOENT') return { version: 2, identity: null, peers: [] }; throw error }
@@ -61,17 +65,38 @@ await fs.mkdir(root, { recursive: true, mode: 0o700 })
 await Promise.all([fs.mkdir(invitesPath, { recursive: true, mode: 0o700 }), fs.mkdir(acceptancesPath, { recursive: true, mode: 0o700 }), fs.mkdir(peersPath, { recursive: true, mode: 0o700 })])
 
 app.disable('x-powered-by')
-app.use((req, res, next) => {
+app.use(async (req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff')
   res.setHeader('X-Frame-Options', 'DENY')
   res.setHeader('Referrer-Policy', 'no-referrer')
-  if (['/api/public-key', '/api/invitations', '/api/acceptances'].includes(req.path)) {
-    res.setHeader('Access-Control-Allow-Origin', '*')
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type')
-    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS')
+  const setCors = (origin) => {
+    res.setHeader('Access-Control-Allow-Origin', origin)
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization')
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+    res.setHeader('Access-Control-Max-Age', '600')
   }
-  if (req.method === 'OPTIONS') return res.sendStatus(204)
-  next()
+  try {
+    // These unauthenticated pairing endpoints must be discoverable by a new,
+    // independently hosted SecureShare instance.
+    if (['/api/public-key', '/api/invitations', '/api/acceptances'].includes(req.path)) {
+      setCors('*')
+    } else {
+      // Uploads carry a bearer token and must come from the origin registered
+      // for this pair.  Reflecting only that origin lets arbitrary SecureShare
+      // domains communicate without giving every website CORS access.
+      const match = req.path.match(/^\/api\/peers\/([a-zA-Z0-9_-]+)\/files$/)
+      const requestOrigin = originOf(req.get('origin'))
+      if (match && requestOrigin) {
+        const peer = (await readState()).peers.find((entry) => entry.pairId === match[1])
+        if (peer && originOf(peer.peerUrl) === requestOrigin) {
+          res.setHeader('Vary', 'Origin')
+          setCors(requestOrigin)
+        }
+      }
+    }
+    if (req.method === 'OPTIONS') return res.sendStatus(204)
+    next()
+  } catch (error) { next(error) }
 })
 app.use(express.json({ limit: '256kb' }))
 
